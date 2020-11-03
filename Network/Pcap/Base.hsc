@@ -1,4 +1,6 @@
 {-# OPTIONS_GHC -fno-warn-unused-binds #-}
+{-# LANGUAGE InterruptibleFFI #-}
+
 ------------------------------------------------------------------------------
 -- |
 --  Module      : Network.Pcap.Base
@@ -96,6 +98,7 @@ module Network.Pcap.Base
     , loop                      -- :: Ptr PcapTag -> Int -> Callback -> IO Int
     , next                      -- :: Ptr PcapTag -> IO (PktHdr, Ptr Word8)
     , dump                      -- :: Ptr PcapDumpTag -> Ptr PktHdr -> Ptr Word8 -> IO ()
+    , breakloop                 -- :: Ptr PcapTag -> IO ()
 
     -- * Sending packets
     , sendPacket
@@ -620,17 +623,25 @@ dump :: Ptr PcapDumpTag -- ^ dump file descriptor
      -> IO ()
 dump hdl hdr pkt = pcap_dump hdl hdr pkt
 
+-- | Break out of a dispatch or loop call.
+breakloop :: Ptr PcapTag -> IO ()
+breakloop = pcap_breakloop
+
 foreign import ccall "wrapper" exportCCallback
         :: CCallback -> IO (FunPtr CCallback)
 
-foreign import ccall pcap_dispatch
+foreign import ccall interruptible pcap_dispatch
         :: Ptr PcapTag -> CInt -> FunPtr CCallback -> Ptr Word8 -> IO CInt
-foreign import ccall pcap_loop
+foreign import ccall interruptible pcap_loop
         :: Ptr PcapTag -> CInt -> FunPtr CCallback -> Ptr Word8 -> IO CInt
-foreign import ccall pcap_next
+foreign import ccall interruptible pcap_next
         :: Ptr PcapTag -> Ptr PktHdr -> IO (Ptr Word8)
 foreign import ccall pcap_dump
         :: Ptr PcapDumpTag -> Ptr PktHdr -> Ptr Word8 -> IO ()
+foreign import ccall unsafe pcap_breakloop
+    :: Ptr PcapTag -> IO ()
+
+
 
 --
 -- Datalink manipulation

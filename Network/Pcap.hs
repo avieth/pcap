@@ -81,6 +81,7 @@ module Network.Pcap
     , loop                      -- :: PcapHandle -> Int -> Callback -> IO Int
     , next                      -- :: PcapHandle -> IO (PktHdr, Ptr Word8)
     , dump                      -- :: Ptr PcapDumpTag -> Ptr PktHdr -> Ptr Word8 -> IO ()
+    , breakloop                 -- :: PcapHandle -> IO ()
 
     -- ** 'B.ByteString' variants
     , dispatchBS                -- :: PcapHandle -> Int -> CallbackBS -> IO Int
@@ -305,6 +306,12 @@ loopBS :: PcapHandle
        -> CallbackBS            -- ^ packet processing function
        -> IO Int                -- ^ number of packets read
 loopBS pch count f = withPcap pch $ \hdl -> P.loop hdl count (wrapBS f)
+
+-- | In order for a dispatch or loop call to be interrupted by an asynchronous
+-- exception, breakloop must be called in some thread which is not itself
+-- blocked, for instance in an `onException` to a concurrent action.
+breakloop :: PcapHandle -> IO ()
+breakloop pch = withPcap pch P.breakloop
 
 -- | Send a raw packet through the network interface.
 sendPacket :: PcapHandle

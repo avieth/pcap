@@ -26,9 +26,11 @@ library
   extensions:      ForeignFunctionInterface, CPP
   ghc-options:     -Wall -funbox-strict-fields
 
-  include-dirs:    include
-  includes:        pcapconfig.h pcap.h
+  include-dirs:     include
+  includes:         pcapconfig.h pcap.h
   install-includes: pcapconfig.h
+
+  extra-libraries: pcap
 
 source-repository head
   type:     git

@@ -50,11 +50,36 @@ module Network.Pcap
     , PktHdr(..)
     , Statistics(..)
 
-    -- * Device opening
+    , P.ErrMsg
+    , P.throwErr
+
+    , create
+    , P.ActivateWarning (..)
+    , P.ActivateError (..)
+    , activate
+    , P.AlreadyActivated (..)
+    , setBufferSize
+    , setTimeout
+    , setImmediate
+    , setSnaplen
+    , setPromisc
+    , setRfmon
+    , P.TstampType (..)
+    , P.SetTstampTypeError (..)
+    , setTstampType
+    , listTstampTypes
+    , P.TstampPrecision (..)
+    , P.SetTstampPrecisionError (..)
+    , setTstampPrecision
+    , getTstampPrecision
+    , close
+
+    -- * Device opening (deprecated API)
     , openOffline               -- :: FilePath -> IO Pcap
     , openLive                  -- :: String -> Int -> Bool -> Int -> IO Pcap
     , openDead                  -- :: Int -> Int -> IO Pcap
-    , openDump                  -- :: PcapHandle -> FilePath -> IO Pdump
+    , openDump                  -- :: PcapHandle -> FilePath -> IO DumpHandle
+    , closeDump                 -- :: DumpeHandle -> IO ()
 
     -- * Filter handling
     , setFilter                 -- :: PcapHandle -> String -> Bool -> Word32 -> IO ()
@@ -101,6 +126,7 @@ module Network.Pcap
     -- * Miscellaneous
     , statistics                -- :: PcapHandle -> IO Statistics
     , version                   -- :: PcapHandle -> IO (Int, Int)
+    , P.libVersion              -- :: IO String
     , isSwapped                 -- :: PcapHandle -> IO Bool
     , snapshotLen               -- :: PcapHandle -> IO Int
     ) where
@@ -116,7 +142,6 @@ import Data.Int (Int64)
 import Data.Time.Clock (DiffTime, picosecondsToDiffTime)
 import Data.Word (Word8, Word32)
 import Foreign.Ptr (Ptr, castPtr)
-import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import qualified Network.Pcap.Base as P
 import Network.Pcap.Base (BpfProgram, Callback, Interface(..), Link(..),
                           Network(..), Direction(..),
@@ -124,13 +149,55 @@ import Network.Pcap.Base (BpfProgram, Callback, Interface(..), Link(..),
                           compileFilter, findAllDevs, lookupDev, lookupNet)
 
 -- | Packet capture handle.
-newtype PcapHandle = PcapHandle (ForeignPtr P.PcapTag)
+newtype PcapHandle = PcapHandle (Ptr P.PcapTag)
 
 -- | Dump file handle.
-newtype DumpHandle = DumpHandle (ForeignPtr P.PcapDumpTag)
+newtype DumpHandle = DumpHandle (Ptr P.PcapDumpTag)
 
 -- | Callback using 'B.ByteString' for packet body.
 type CallbackBS = PktHdr -> B.ByteString -> IO ()
+
+-- | Create a pcap handle for a given interface.
+-- Be sure to close it. You almost certainly want to use bracket or similar.
+create :: String -> IO PcapHandle
+create ifaceName = fmap PcapHandle (P.create ifaceName)
+
+-- | Close a pcap handle.
+close :: PcapHandle -> IO ()
+close (PcapHandle ptr) = P.close ptr
+
+activate :: PcapHandle -> IO (Either P.ActivateError (Either P.ActivateWarning ()))
+activate (PcapHandle ptr) = P.activate ptr
+
+setBufferSize :: PcapHandle -> Int -> IO (Either P.AlreadyActivated ())
+setBufferSize (PcapHandle ptr) = P.setBufferSize ptr
+
+setTimeout :: PcapHandle -> Int -> IO (Either P.AlreadyActivated ())
+setTimeout (PcapHandle ptr) = P.setTimeout ptr
+
+setImmediate :: PcapHandle -> Bool -> IO (Either P.AlreadyActivated ())
+setImmediate (PcapHandle ptr) b = P.setImmediate ptr (if b then 1 else 0)
+
+setSnaplen :: PcapHandle -> Int -> IO (Either P.AlreadyActivated ())
+setSnaplen (PcapHandle ptr) = P.setSnaplen ptr
+
+setPromisc :: PcapHandle -> Bool -> IO (Either P.AlreadyActivated ())
+setPromisc (PcapHandle ptr) b = P.setPromisc ptr (if b then 1 else 0)
+
+setRfmon :: PcapHandle -> Bool -> IO (Either P.AlreadyActivated ())
+setRfmon (PcapHandle ptr) b = P.setRfmon ptr (if b then 1 else 0)
+
+setTstampType :: PcapHandle -> P.TstampType -> IO (Either P.SetTstampTypeError ())
+setTstampType (PcapHandle ptr) = P.setTstampType ptr
+
+setTstampPrecision :: PcapHandle -> P.TstampPrecision -> IO (Either P.SetTstampPrecisionError ())
+setTstampPrecision (PcapHandle ptr) = P.setTstampPrecision ptr
+
+getTstampPrecision :: PcapHandle -> IO P.TstampPrecision
+getTstampPrecision (PcapHandle ptr) = P.getTstampPrecision ptr
+
+listTstampTypes :: PcapHandle -> IO (Either P.ErrMsg [P.TstampType])
+listTstampTypes (PcapHandle ptr) = P.listTstampTypes ptr
 
 --
 -- Open a device
@@ -182,11 +249,11 @@ openDead link snaplen = PcapHandle `fmap` P.openDead link snaplen
 
 {-# INLINE withPcap #-}
 withPcap :: PcapHandle -> (Ptr P.PcapTag -> IO a) -> IO a
-withPcap (PcapHandle hdl) = withForeignPtr hdl
+withPcap (PcapHandle hdl) = ($ hdl)
 
 {-# INLINE withDump #-}
 withDump :: DumpHandle -> (Ptr P.PcapDumpTag -> IO a) -> IO a
-withDump (DumpHandle hdl) = withForeignPtr hdl
+withDump (DumpHandle hdl) = ($ hdl)
 
 --
 -- Open a dump device
@@ -199,6 +266,9 @@ openDump :: PcapHandle          -- ^ packet capture handle
          -> IO DumpHandle
 openDump pch name = withPcap pch $ \hdl ->
     DumpHandle `fmap` P.openDump hdl name
+
+closeDump :: DumpHandle -> IO ()
+closeDump (DumpHandle hdl) = P.closeDump hdl
 
 --
 -- Set the filter
@@ -240,15 +310,23 @@ setDirection :: PcapHandle -> Direction -> IO ()
 setDirection pch dir = withPcap pch $ \hdl -> P.setDirection hdl dir
 
 {-# INLINE hdrTime #-}
--- | Get the timestamp of a packet as a single quantity, in
--- microseconds.
-hdrTime :: PktHdr -> Int64
-hdrTime pkt = fromIntegral (hdrSeconds pkt) * 1000000 +
-              fromIntegral (hdrUseconds pkt)
+-- | Get the timestamp of a packet as a single quantity.
+hdrTime :: P.TstampPrecision -> PktHdr -> Int64
+hdrTime tprec pkt = fromIntegral (hdrSeconds pkt) * multiplier +
+                    fromIntegral (hdrUseconds pkt)
+  where
+  multiplier = case tprec of
+    P.TstampPrecisionMicro -> 1000000
+    P.TstampPrecisionNano  -> 1000000000
 
+{-# INLINE hdrDiffTime #-}
 -- | Get the timestamp of a packet as a 'DiffTime'.
-hdrDiffTime :: PktHdr -> DiffTime
-hdrDiffTime pkt = picosecondsToDiffTime (fromIntegral (hdrTime pkt) * 1000000)
+hdrDiffTime :: P.TstampPrecision -> PktHdr -> DiffTime
+hdrDiffTime tprec pkt = picosecondsToDiffTime (fromIntegral (hdrTime tprec pkt * multiplier))
+  where
+  multiplier = case tprec of
+    P.TstampPrecisionMicro -> 1000000
+    P.TstampPrecisionNano  -> 1000
 
 --
 -- Reading packets
@@ -377,7 +455,9 @@ setDatalink pch link = withPcap pch $ \hdl -> P.setDatalink hdl link
 -- handle. Entries from the resulting list are valid arguments to
 -- 'setDatalink'.
 listDatalinks :: PcapHandle -> IO [Link]
-listDatalinks pch = withPcap pch P.listDatalinks
+listDatalinks pch = withPcap pch $ \it -> do
+  outcome <- P.listDatalinks it
+  either P.throwErr pure outcome
 
 -- | Returns the number of packets received, the number of packets
 -- dropped by the packet filter and the number of packets dropped by

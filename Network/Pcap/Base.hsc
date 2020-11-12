@@ -67,11 +67,36 @@ module Network.Pcap.Base
     , PktHdr(..)
     , Statistics(..)
 
+    , ErrMsg
+    , throwErr
+
+    , create
+    , close
+    , ActivateWarning (..)
+    , ActivateError (..)
+    , activate
+    , AlreadyActivated (..)
+    , setBufferSize
+    , setTimeout
+    , setImmediate
+    , setSnaplen
+    , setPromisc
+    , setRfmon
+    , TstampType (..)
+    , SetTstampTypeError (..)
+    , setTstampType
+    , listTstampTypes
+    , TstampPrecision (..)
+    , SetTstampPrecisionError (..)
+    , setTstampPrecision
+    , getTstampPrecision
+
     -- * Device opening
     , openOffline               -- :: FilePath -> IO Pcap
     , openLive                  -- :: String -> Int -> Bool -> Int -> IO Pcap
     , openDead                  -- :: Int    -> Int -> IO Pcap
     , openDump                  -- :: Ptr PcapTag -> FilePath -> IO Pdump
+    , closeDump                 -- :: Ptr PcapDumpTag -> IO ()
 
     -- * Filter handling
     , setFilter                 -- :: Ptr PcapTag -> String -> Bool -> Word32 -> IO ()
@@ -109,10 +134,12 @@ module Network.Pcap.Base
     -- * Miscellaneous
     , statistics                -- :: Ptr PcapTag -> IO Statistics
     , version                   -- :: Ptr PcapTag -> IO (Int, Int)
+    , libVersion                -- :: IO String
     , isSwapped                 -- :: Ptr PcapTag -> IO Bool
     , snapshotLen               -- :: Ptr PcapTag -> IO Int
     ) where
 
+import Control.Exception (bracket, uninterruptibleMask_)
 import Control.Monad (when)
 import Data.Maybe (isNothing, fromJust )
 import Data.ByteString ()
@@ -124,10 +151,10 @@ import qualified Data.ByteString.Internal as B
 import Data.Word (Word8, Word32)
 import Foreign.Ptr (Ptr, plusPtr, nullPtr, FunPtr, freeHaskellFunPtr)
 import Foreign.C.String (CString, peekCString, withCString)
-import Foreign.C.Types (CInt(..), CUInt, CChar, CUChar, CLong)
+import Foreign.C.Types (CInt(..), CUInt (..), CChar, CUChar, CLong)
 import Foreign.Concurrent (newForeignPtr)
 import Foreign.ForeignPtr (ForeignPtr)
-import Foreign.Marshal.Alloc (alloca, allocaBytes, free)
+import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Marshal.Utils (fromBool, toBool)
 import Foreign.Storable (Storable(..))
@@ -148,7 +175,7 @@ newtype PcapTag = PcapTag ()
 newtype PcapDumpTag = PcapDumpTag ()
 
 -- | Dump file descriptor.
-type Pdump = ForeignPtr PcapDumpTag
+type Pdump = Ptr PcapDumpTag
 
 data PktHdr = PktHdr {
       hdrSeconds :: {-# UNPACK #-} !Word32       -- ^ timestamp (seconds)
@@ -164,6 +191,11 @@ data Statistics = Statistics {
     } deriving (Eq, Show)
 
 type ErrBuf = Ptr CChar
+
+type ErrMsg = String
+
+throwErr :: ErrMsg -> IO x
+throwErr = ioError . userError
 
 --
 -- Data types for interface list
@@ -211,15 +243,268 @@ withErrBuf isError f = allocaArray (#const PCAP_ERRBUF_SIZE) $ \errPtr -> do
 withErrBuf_ :: (a -> Bool) -> (ErrBuf -> IO a) -> IO ()
 withErrBuf_ isError f = withErrBuf isError f >> return ()
 
+withErrMsg
+  :: (a -> Bool)
+  -> (ErrBuf -> IO a)
+  -> IO (Either ErrMsg a)
+withErrMsg isError f = allocaArray (#const PCAP_ERRBUF_SIZE) $ \errPtr -> do
+  ret <- f errPtr
+  if isError ret
+    then peekCString errPtr >>= pure . Left
+    else return (Right ret)
+
+-- | Use 'pcap_create' to create a live capture handle.
+create :: String -> IO (Ptr PcapTag)
+create ifaceName = withCString ifaceName $ \namePtr ->
+  withErrBuf (== nullPtr) $ \errBufPtr -> pcap_create namePtr errBufPtr
+
+foreign import ccall unsafe pcap_create
+  :: CString -> ErrBuf -> IO (Ptr PcapTag)
+
+-- | Use 'pcap_close' to close a pcap handle.
+close :: Ptr PcapTag -> IO ()
+close = pcap_close
+
+foreign import ccall unsafe pcap_close
+  :: Ptr PcapTag -> IO ()
+
+data ActivateWarning =
+    ActivatePromiscNotSupported
+  | ActivateTimestampTypeNotSupported
+  | ActivateWarning !String
+  deriving (Eq, Ord, Show)
+
+data ActivateError =
+    ActivateAlreadyActivated
+  | ActivateNoSuchDevice
+  | ActivatePermissionDenied
+  | ActivatePromiscPermissionDenied
+  | ActivateMonitorNotSupported
+  | ActivateInterfaceNotUp
+  | ActivateError !String
+  deriving (Eq, Ord, Show)
+
+-- | Use 'pcap_activate' to begin capture. 
+activate :: Ptr PcapTag -> IO (Either ActivateError (Either ActivateWarning ()))
+activate pcaph = do
+  cint <- pcap_activate pcaph
+  case cint of
+
+    0 -> pure $ Right (Right ())
+
+    -- Warnings
+    (#const PCAP_WARNING_PROMISC_NOTSUP)     -> pure $
+      Right (Left ActivatePromiscNotSupported)
+    (#const PCAP_WARNING_TSTAMP_TYPE_NOTSUP) -> pure $
+      Right (Left ActivateTimestampTypeNotSupported)
+    (#const PCAP_WARNING)                    -> do
+      str <- getErr pcaph
+      pure $ Right (Left (ActivateWarning str))
+
+    -- Errors
+    (#const PCAP_ERROR_ACTIVATED)            -> pure $
+      Left ActivateAlreadyActivated
+    (#const PCAP_ERROR_NO_SUCH_DEVICE)      -> pure $
+      Left ActivateNoSuchDevice
+    (#const PCAP_ERROR_PERM_DENIED)         -> pure $
+      Left ActivatePermissionDenied
+    (#const PCAP_ERROR_PROMISC_PERM_DENIED) -> pure $
+      Left ActivatePromiscPermissionDenied
+    (#const PCAP_ERROR_RFMON_NOTSUP)        -> pure $
+      Left ActivateMonitorNotSupported
+    (#const PCAP_ERROR_IFACE_NOT_UP)        -> pure $
+      Left ActivateInterfaceNotUp
+    (#const PCAP_ERROR)                     -> do
+      str <- getErr pcaph
+      pure $ Left (ActivateError str)
+
+    _ -> error "pcap_activate: unexpected return value"
+
+foreign import ccall unsafe pcap_activate
+  :: Ptr PcapTag -> IO CInt
+
+data AlreadyActivated = AlreadyActivated
+  deriving (Eq, Ord, Show)
+
+-- | Use 'pcap_set_buffer_size' to control buffering between kernel and user
+-- space.
+setBufferSize :: Ptr PcapTag -> Int -> IO (Either AlreadyActivated ())
+setBufferSize pcaph sz = do
+  cint <- pcap_set_buffer_size pcaph (fromIntegral sz)
+  case cint of
+    0 -> pure (Right ())
+    (#const PCAP_ERROR_ACTIVATED) -> pure (Left AlreadyActivated)
+    _ -> error "pcap_set_buffer_size: unexpected return value"
+
+foreign import ccall unsafe pcap_set_buffer_size
+  :: Ptr PcapTag -> CInt -> IO CInt
+
+setImmediate :: Ptr PcapTag -> Int -> IO (Either AlreadyActivated ())
+setImmediate pcaph n = do
+  cint <- pcap_set_immediate_mode pcaph (fromIntegral n)
+  case cint of
+    0 -> pure (Right ())
+    (#const PCAP_ERROR_ACTIVATED) -> pure (Left AlreadyActivated)
+    _ -> error "pcap_set_immediate_mode: unexpected return value"
+
+foreign import ccall unsafe pcap_set_immediate_mode
+  :: Ptr PcapTag -> CInt -> IO CInt
+
+-- | Use 'pcap_set_timeout' to control the packet buffer timeout (in
+-- milliseconds).
+setTimeout :: Ptr PcapTag -> Int -> IO (Either AlreadyActivated ())
+setTimeout pcaph tout = do
+  cint <- pcap_set_timeout pcaph (fromIntegral tout)
+  case cint of
+    0 -> pure (Right ())
+    (#const PCAP_ERROR_ACTIVATED) -> pure (Left AlreadyActivated)
+    _ -> error "pcap_set_timeout: unexpected return value"
+
+foreign import ccall unsafe pcap_set_timeout
+  :: Ptr PcapTag -> CInt -> IO CInt
+
+-- | Use 'pcap_set_snaplen' to control the snapshot length.
+setSnaplen :: Ptr PcapTag -> Int -> IO (Either AlreadyActivated ())
+setSnaplen pcaph slen = do
+  cint <- pcap_set_snaplen pcaph (fromIntegral slen)
+  case cint of
+    0 -> pure (Right ())
+    (#const PCAP_ERROR_ACTIVATED) -> pure (Left AlreadyActivated)
+    _ -> error "pcap_set_snaplen: unexpected return value"
+
+foreign import ccall unsafe pcap_set_snaplen
+  :: Ptr PcapTag -> CInt -> IO CInt
+
+-- | Use 'pcap_set_promisc' to control promiscuous mode on the handle/interface.
+-- Non-zero means "yes".
+setPromisc :: Ptr PcapTag -> Int -> IO (Either AlreadyActivated ())
+setPromisc pcaph pmsc = do
+  cint <- pcap_set_promisc pcaph (fromIntegral pmsc)
+  case cint of
+    0 -> pure (Right ())
+    (#const PCAP_ERROR_ACTIVATED) -> pure (Left AlreadyActivated)
+    _ -> error "pcap_set_promisc: unexpected return value"
+
+foreign import ccall unsafe pcap_set_promisc
+  :: Ptr PcapTag -> CInt -> IO CInt
+
+-- | Use 'pcap_set_rfmon' to control monitor mode on the handle/interface.
+-- Non-zero means "yes".
+setRfmon :: Ptr PcapTag -> Int -> IO (Either AlreadyActivated ())
+setRfmon pcaph pmsc = do
+  cint <- pcap_set_rfmon pcaph (fromIntegral pmsc)
+  case cint of
+    0 -> pure (Right ())
+    (#const PCAP_ERROR_ACTIVATED) -> pure (Left AlreadyActivated)
+    _ -> error "pcap_set_rfmon: unexpected return value"
+
+foreign import ccall unsafe pcap_set_rfmon
+  :: Ptr PcapTag -> CInt -> IO CInt
+
+data TstampType =
+    TstampHost
+  | TstampHostLowprec
+  | TstampHostHiprec
+  | TstampAdapter
+  | TstampAdapterUnsynced
+  deriving (Eq, Ord, Show)
+
+packTstampType :: TstampType -> CInt
+packTstampType it = case it of
+  TstampHost               -> (#const PCAP_TSTAMP_HOST)
+  TstampHostLowprec        -> (#const PCAP_TSTAMP_HOST_LOWPREC)
+  TstampHostHiprec         -> (#const PCAP_TSTAMP_HOST_HIPREC)
+  TstampAdapter            -> (#const PCAP_TSTAMP_ADAPTER)
+  TstampAdapterUnsynced    -> (#const PCAP_TSTAMP_ADAPTER_UNSYNCED)
+
+unpackTstampType :: CInt -> TstampType
+unpackTstampType it = case it of
+  (#const PCAP_TSTAMP_HOST)             -> TstampHost
+  (#const PCAP_TSTAMP_HOST_LOWPREC)     -> TstampHostLowprec
+  (#const PCAP_TSTAMP_HOST_HIPREC)      -> TstampHostHiprec
+  (#const PCAP_TSTAMP_ADAPTER)          -> TstampAdapter
+  (#const PCAP_TSTAMP_ADAPTER_UNSYNCED) -> TstampAdapterUnsynced
+  _ -> error "unexpected timestamp type"
+
+data SetTstampTypeError =
+    SetTstampTypeAlreadyActivated
+  | SetTstampTypeNotSupported
+  | SetTstampTypeCantSet
+  deriving (Eq, Ord, Show)
+
+-- | Use 'pcap_set_tstamp_type' to control the timestamp type on the
+-- handle/interface.
+setTstampType :: Ptr PcapTag -> TstampType -> IO (Either SetTstampTypeError ())
+setTstampType pcaph tty = do
+  cint <- pcap_set_tstamp_type pcaph (packTstampType tty)
+  case cint of
+    0 -> pure (Right ())
+    (#const PCAP_ERROR_ACTIVATED)            -> pure $
+      Left SetTstampTypeAlreadyActivated
+    (#const PCAP_ERROR_CANTSET_TSTAMP_TYPE)  -> pure $
+      Left SetTstampTypeCantSet
+    (#const PCAP_WARNING_TSTAMP_TYPE_NOTSUP) -> pure $
+      Left SetTstampTypeNotSupported
+    _ -> error "pcap_set_tstamp_type: unexpected return value"
+
+foreign import ccall unsafe pcap_set_tstamp_type
+  :: Ptr PcapTag -> CInt -> IO CInt
+
+data TstampPrecision =
+    TstampPrecisionMicro
+  | TstampPrecisionNano
+  deriving (Eq, Ord, Show)
+
+packTstampPrecision :: TstampPrecision -> CInt
+packTstampPrecision TstampPrecisionMicro = (#const PCAP_TSTAMP_PRECISION_MICRO)
+packTstampPrecision TstampPrecisionNano  = (#const PCAP_TSTAMP_PRECISION_NANO)
+
+unpackTstampPrecision :: CInt -> TstampPrecision
+unpackTstampPrecision it = case it of
+  (#const PCAP_TSTAMP_PRECISION_MICRO) -> TstampPrecisionMicro
+  (#const PCAP_TSTAMP_PRECISION_NANO)  -> TstampPrecisionNano
+  _ -> error "unexpected timestamp precision"
+
+data SetTstampPrecisionError =
+    SetTstampPrecisionAlreadyActivated
+  | SetTstampPrecisionNotSupported
+  deriving (Eq, Ord, Show)
+
+-- | Use 'pcap_set_tstamp_precision' to control the timestamp precision on the
+-- handle/interface.
+setTstampPrecision
+  :: Ptr PcapTag
+  -> TstampPrecision
+  -> IO (Either SetTstampPrecisionError ())
+setTstampPrecision pcaph tp = do
+  cint <- pcap_set_tstamp_precision pcaph (packTstampPrecision tp)
+  case cint of
+    0 -> pure (Right ())
+    (#const PCAP_ERROR_ACTIVATED)               -> pure $
+      Left SetTstampPrecisionAlreadyActivated
+    (#const PCAP_ERROR_TSTAMP_PRECISION_NOTSUP) -> pure $
+      Left SetTstampPrecisionNotSupported
+    _ -> error "pcap_set_tstamp_precision: unexpected return value"
+
+getTstampPrecision :: Ptr PcapTag -> IO TstampPrecision
+getTstampPrecision pcaph =
+  fmap unpackTstampPrecision (pcap_get_tstamp_precision pcaph)
+
+foreign import ccall unsafe pcap_set_tstamp_precision
+  :: Ptr PcapTag -> CInt -> IO CInt
+
+foreign import ccall unsafe pcap_get_tstamp_precision
+  :: Ptr PcapTag -> IO CInt
+
+
 -- | 'openOffline' opens a dump file for reading. The file format is
 -- the same as used by @tcpdump@ and Wireshark. The string @\"-\"@ is
 -- a synonym for @stdin@.
 openOffline :: FilePath -- ^ filename
-            -> IO (ForeignPtr PcapTag)
+            -> IO (Ptr PcapTag)
 openOffline name =
     withCString name $ \namePtr -> do
-      ptr <- withErrBuf (== nullPtr) (pcap_open_offline namePtr)
-      newForeignPtr ptr (pcap_close ptr)
+      withErrBuf (== nullPtr) (pcap_open_offline namePtr)
 
 -- | 'openLive' is used to get a packet descriptor that can be used to
 -- look at packets on the network. The arguments are the device name,
@@ -236,12 +521,11 @@ openLive :: String -- ^ device name
          -> Int    -- ^ snapshot length
          -> Bool   -- ^ set to promiscuous mode?
          -> Int    -- ^ timeout in milliseconds
-         -> IO (ForeignPtr PcapTag)
+         -> IO (Ptr PcapTag)
 openLive name snaplen promisc timeout =
     withCString name $ \namePtr -> do
-      ptr <- withErrBuf (== nullPtr) $ pcap_open_live namePtr
-             (fromIntegral snaplen) (fromBool promisc) (fromIntegral timeout)
-      newForeignPtr ptr (pcap_close ptr)
+      withErrBuf (== nullPtr) $ pcap_open_live namePtr
+        (fromIntegral snaplen) (fromBool promisc) (fromIntegral timeout)
 
 -- | 'openDead' is used to get a packet capture descriptor without
 -- opening a file or device. It is typically used to test packet
@@ -250,18 +534,16 @@ openLive name snaplen promisc timeout =
 --
 openDead :: Link                    -- ^ datalink type
          -> Int                     -- ^ snapshot length
-         -> IO (ForeignPtr PcapTag) -- ^ packet capture descriptor
+         -> IO (Ptr PcapTag) -- ^ packet capture descriptor
 openDead link snaplen = do
     ptr <- pcap_open_dead (packLink link)
            (fromIntegral snaplen)
     when (ptr == nullPtr) $
         ioError $ userError "Can't open dead pcap device"
-    newForeignPtr ptr (pcap_close ptr)
+    pure ptr
 
 foreign import ccall unsafe pcap_open_offline
     :: CString   -> ErrBuf -> IO (Ptr PcapTag)
-foreign import ccall unsafe pcap_close
-    :: Ptr PcapTag -> IO ()
 foreign import ccall unsafe pcap_open_live
     :: CString -> CInt -> CInt -> CInt -> ErrBuf -> IO (Ptr PcapTag)
 foreign import ccall unsafe pcap_open_dead
@@ -278,10 +560,11 @@ foreign import ccall unsafe pcap_open_dead
 openDump :: Ptr PcapTag -- ^ packet capture descriptor
          -> FilePath    -- ^ dump file name
          -> IO Pdump    -- ^ savefile descriptor
-openDump hdl name =
-    withCString name $ \namePtr -> do
-      ptr <- pcap_dump_open hdl namePtr >>= throwPcapIf hdl (== nullPtr)
-      newForeignPtr ptr (pcap_dump_close ptr)
+openDump hdl name = withCString name $ \namePtr -> do
+  pcap_dump_open hdl namePtr >>= throwPcapIf hdl (== nullPtr)
+
+closeDump :: Pdump -> IO ()
+closeDump = pcap_dump_close
 
 foreign import ccall unsafe pcap_dump_open
     :: Ptr PcapTag -> CString -> IO (Ptr PcapDumpTag)
@@ -520,6 +803,11 @@ throwPcapIf hdl p v = if p v
 throwPcapIf_ :: Ptr PcapTag -> (a -> Bool) -> a -> IO ()
 throwPcapIf_ hdl p v = throwPcapIf hdl p v >> return ()
 
+getErr :: Ptr PcapTag -> IO String
+getErr pcaph = do
+  cstr <- pcap_geterr pcaph
+  peekCString cstr
+
 foreign import ccall unsafe pcap_geterr
     :: Ptr PcapTag -> IO CString
 
@@ -575,13 +863,9 @@ dispatch :: Ptr PcapTag -- ^ packet capture descriptor
          -> Int         -- ^ number of packets to process
          -> Callback    -- ^ packet processing function
          -> IO Int      -- ^ number of packets read
-dispatch hdl count f = do
-    handler <- exportCallback f
-    result  <- pcap_dispatch hdl (fromIntegral count) handler nullPtr
-
-    freeHaskellFunPtr handler
-
-    fromIntegral `fmap` throwPcapIf hdl (== -1) result
+dispatch hdl count f = bracket (exportCallback f) freeHaskellFunPtr $ \cb -> do
+  result <- pcap_dispatch hdl (fromIntegral count) cb nullPtr
+  fromIntegral `fmap` throwPcapIf hdl (== -1) result
 
 -- | Similar to 'dispatch', but loop until the number of packets
 -- specified by the second argument are read. A negative value loops
@@ -593,13 +877,9 @@ loop :: Ptr PcapTag -- ^ packet capture descriptor
      -> Int         -- ^ number of packet to read
      -> Callback    -- ^ packet processing function
      -> IO Int      -- ^ number of packets read
-loop hdl count f = do
-    handler <- exportCallback f
-    result  <- pcap_loop hdl (fromIntegral count) handler nullPtr
-
-    freeHaskellFunPtr handler
-
-    fromIntegral `fmap` throwPcapIf hdl (== -1) result
+loop hdl count f = bracket (exportCallback f) freeHaskellFunPtr $ \cb -> do
+  result  <- pcap_loop hdl (fromIntegral count) cb nullPtr
+  fromIntegral `fmap` throwPcapIf hdl (== -1) result
 
 -- | Read the next packet (equivalent to calling 'dispatch' with a
 -- count of 1).
@@ -623,9 +903,6 @@ dump :: Ptr PcapDumpTag -- ^ dump file descriptor
      -> IO ()
 dump hdl hdr pkt = pcap_dump hdl hdr pkt
 
--- | Break out of a dispatch or loop call.
-breakloop :: Ptr PcapTag -> IO ()
-breakloop = pcap_breakloop
 
 foreign import ccall "wrapper" exportCCallback
         :: CCallback -> IO (FunPtr CCallback)
@@ -638,9 +915,13 @@ foreign import ccall interruptible pcap_next
         :: Ptr PcapTag -> Ptr PktHdr -> IO (Ptr Word8)
 foreign import ccall pcap_dump
         :: Ptr PcapDumpTag -> Ptr PktHdr -> Ptr Word8 -> IO ()
+
+-- | Break out of a dispatch or loop call.
+breakloop :: Ptr PcapTag -> IO ()
+breakloop = pcap_breakloop
+
 foreign import ccall unsafe pcap_breakloop
     :: Ptr PcapTag -> IO ()
-
 
 
 --
@@ -662,14 +943,19 @@ setDatalink hdl link =
 -- | List all the datalink types supported by a pcap descriptor.
 -- Entries from the resulting list are valid arguments to
 -- 'setDatalink'.
-listDatalinks :: Ptr PcapTag -> IO [Link]
-listDatalinks hdl =
-    alloca $ \lptr -> do
-      ret <- pcap_list_datalinks hdl lptr >>= throwPcapIf hdl (== -1)
-      dlbuf <- peek lptr
-      dls <- peekArray (fromIntegral (ret :: CInt)) dlbuf
-      free dlbuf
-      return (map unpackLink dls)
+listDatalinks :: Ptr PcapTag -> IO (Either ErrMsg [Link])
+listDatalinks pcaph = alloca $ \lptr -> uninterruptibleMask_ $ do
+  cint <- pcap_list_datalinks pcaph lptr
+  lst <- peek lptr
+  ret <- if cint < 0
+    then do
+      str <- getErr pcaph
+      pure $ Left str
+    else do
+      ls <- peekArray (fromIntegral cint) lst
+      pure $ Right (fmap unpackLink ls)
+  pcap_free_datalinks lst
+  pure ret
 
 foreign import ccall unsafe pcap_datalink
     :: Ptr PcapTag -> IO CInt
@@ -677,6 +963,32 @@ foreign import ccall unsafe pcap_set_datalink
     :: Ptr PcapTag -> CInt -> IO CInt
 foreign import ccall unsafe pcap_list_datalinks
     :: Ptr PcapTag -> Ptr (Ptr CInt) -> IO CInt
+foreign import ccall unsafe pcap_free_datalinks
+    :: Ptr CInt -> IO ()
+
+listTstampTypes :: Ptr PcapTag -> IO (Either ErrMsg [TstampType])
+listTstampTypes pcaph = alloca $ \lptr -> uninterruptibleMask_ $ do
+  -- Runs in an uninterruptibleMask_ because
+  -- 1. Nothing in here will ever block
+  -- 2. We need to ensure that pcap_free_tstamp_types is always called.
+  -- The man page is not clear about whether we need to pcap_free_tstamp if
+  -- there's an error. Let's just assume that we should...
+  cint <- pcap_list_tstamp_types pcaph lptr
+  lst <- peek lptr
+  ret <- if cint < 0
+    then do
+      str <- getErr pcaph
+      pure (Left str)
+    else do
+      tys <- peekArray (fromIntegral cint) lst
+      pure $ Right (fmap unpackTstampType tys)
+  pcap_free_tstamp_types lst
+  pure ret
+
+foreign import ccall unsafe pcap_list_tstamp_types
+  :: Ptr PcapTag -> Ptr (Ptr CInt) -> IO CInt
+foreign import ccall unsafe pcap_free_tstamp_types
+  :: Ptr CInt -> IO ()
 
 --
 -- Statistics
@@ -709,6 +1021,12 @@ version hdl = do
   major <- pcap_major_version hdl
   minor <- pcap_minor_version hdl
   return (fromIntegral major, fromIntegral minor)
+
+libVersion :: IO String
+libVersion = pcap_lib_version >>= peekCString
+
+foreign import ccall unsafe pcap_lib_version :: IO CString
+
 
 -- | 'isSwapped' returns 'True' if the current dump file uses a
 -- different byte order than the one native to the system.

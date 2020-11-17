@@ -311,10 +311,11 @@ setDirection pch dir = withPcap pch $ \hdl -> P.setDirection hdl dir
 
 {-# INLINE hdrTime #-}
 -- | Get the timestamp of a packet as a single quantity.
-hdrTime :: P.TstampPrecision -> PktHdr -> Int64
+hdrTime :: P.TstampPrecision -> PktHdr -> Integer
 hdrTime tprec pkt = fromIntegral (hdrSeconds pkt) * multiplier +
                     fromIntegral (hdrUseconds pkt)
   where
+  multiplier :: Integer
   multiplier = case tprec of
     P.TstampPrecisionMicro -> 1000000
     P.TstampPrecisionNano  -> 1000000000
@@ -324,6 +325,7 @@ hdrTime tprec pkt = fromIntegral (hdrSeconds pkt) * multiplier +
 hdrDiffTime :: P.TstampPrecision -> PktHdr -> DiffTime
 hdrDiffTime tprec pkt = picosecondsToDiffTime (fromIntegral (hdrTime tprec pkt * multiplier))
   where
+  multiplier :: Integer
   multiplier = case tprec of
     P.TstampPrecisionMicro -> 1000000
     P.TstampPrecisionNano  -> 1000

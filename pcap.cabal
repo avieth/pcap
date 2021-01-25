@@ -1,6 +1,7 @@
+cabal-version:   3.0
 name:            pcap
 version:         0.4.5.2
-license:         BSD3
+license:         BSD-3-Clause
 license-file:    LICENSE
 synopsis:        A system-independent interface for user-level packet capture
 description:     A system-independent interface for user-level packet capture
@@ -9,7 +10,6 @@ author:          Bryan O'Sullivan, Nick Burlett, Dominic Steinitz, Gregory Wrigh
 homepage:        https://github.com/bos/pcap
 bug-reports:     https://github.com/bos/pcap/issues
 category:        Network
-cabal-version:   >= 1.6
 extra-source-files:
                  configure.ac configure include/pcapconfig.h.in
                  pcap.buildinfo.in README.markdown
@@ -23,14 +23,15 @@ library
 
   exposed-modules: Network.Pcap.Base
                    Network.Pcap
-  extensions:      ForeignFunctionInterface, CPP
+  default-extensions: ForeignFunctionInterface, CPP
   ghc-options:     -Wall -funbox-strict-fields
 
   include-dirs:     include
   includes:         pcapconfig.h pcap.h
+  autogen-includes: pcapconfig.h
   install-includes: pcapconfig.h
 
-  extra-libraries: pcap
+  extra-libraries:  pcap
 
 source-repository head
   type:     git
